@@ -12,9 +12,14 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 import pandas as pd
-from pandas.api.types import is_datetime64tz_dtype
+from pandas.api.types import is_datetime64tz_dtype  # noqa: F401 kept for compat
 
 from config.settings import TIMEFRAME_FREQ
+
+# Timeframe frequency aliases — 'D' replaces deprecated lowercase 'd'.
+_FREQ_ALIASES: dict[str, str] = {
+    k: v.replace("1d", "1D") for k, v in TIMEFRAME_FREQ.items()
+}
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -74,7 +79,7 @@ def fetch_placeholder_candles(symbol: str, timeframe: str) -> pd.DataFrame:
     timestamps = pd.date_range(
         end=end,
         periods=_PLACEHOLDER_CANDLE_COUNT,
-        freq=TIMEFRAME_FREQ[timeframe],
+        freq=_FREQ_ALIASES[timeframe],
         tz="UTC",
     )
 
@@ -146,7 +151,7 @@ def validate_candle_schema(df: pd.DataFrame) -> None:
         )
 
     # 4. Timezone-aware UTC timestamps.
-    if not is_datetime64tz_dtype(df["timestamp"]):
+    if not isinstance(df["timestamp"].dtype, pd.DatetimeTZDtype):
         raise ValueError(
             "Candle DataFrame 'timestamp' column must be timezone-aware (UTC). "
             "Found timezone-naive timestamps."

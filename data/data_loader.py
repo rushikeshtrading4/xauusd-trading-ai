@@ -28,6 +28,7 @@ import pandas as pd
 
 from config.settings import SUPPORTED_SYMBOL, TIMEFRAMES
 from data.market_data import fetch_placeholder_candles, validate_candle_schema
+from data.oanda_feed import fetch_oanda_candles
 
 
 def load_market_data(
@@ -49,8 +50,7 @@ def load_market_data(
               suitable for development and unit-testing without a live feed.
             - ``"csv"`` *(not yet implemented)* — historical data from local
               CSV files.
-            - ``"api"`` *(not yet implemented)* — live or historical data from
-              a broker / data-provider API.
+            - ``"oanda"`` — live OANDA REST API data.
 
     Returns:
         Dictionary mapping each timeframe string to a validated
@@ -84,12 +84,12 @@ def load_market_data(
             df = fetch_placeholder_candles(symbol, timeframe)
         elif source == "csv":
             raise NotImplementedError("CSV data source not implemented yet.")
-        elif source == "api":
-            raise NotImplementedError("API data source not implemented yet.")
+        elif source == "oanda":
+            df = fetch_oanda_candles(symbol, timeframe)
         else:
             raise ValueError(
                 f"Unsupported data source '{source}'. "
-                f"Supported sources: 'placeholder', 'csv', 'api'."
+                f"Supported sources: 'placeholder', 'csv', 'oanda'."
             )
 
         validate_candle_schema(df)
