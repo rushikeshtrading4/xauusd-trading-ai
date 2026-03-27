@@ -5,18 +5,30 @@ execution pipeline together into a single call.  Given a dict of multi-
 timeframe OHLCV DataFrames it:
 
     1. Runs the complete analysis pipeline on the M5 execution timeframe.
-    2. Extracts a structured market context from the latest candle.
-    3. Scores the setup via the probability model.
-    4. Applies the potential-setup quality gate.
-    5. Builds the precise trade geometry (entry, SL, TP, RR).
-    6. Validates the trade against institutional risk controls.
-    7. Formats and returns the human-readable trade card.
+    2. Runs analysis on H4 and D1 for multi-timeframe bias calculation.
+    3. Extracts a structured market context from the latest candle.
+    4. Scores the setup via the probability model.
+    5. Applies the potential-setup quality gate.
+    6. Builds the precise trade geometry (entry, SL, TP, RR).
+    7. Validates the trade against institutional risk controls.
+    8. Formats and returns the human-readable trade card.
 
 Returns ``None`` at any gate that is not satisfied (no trade opportunity).
-Returns the formatted trade-card string when all gates pass.
+Returns the formatted trade-card string when all pipeline gates pass.
 
-Pipeline position
------------------
+Architecture notes
+------------------
+* A single MacroDataHandler instance is shared across the module.
+  Callers should inject macro state via ``get_macro_handler()`` rather than
+  creating their own instances, to avoid the singleton isolation bug that
+  previously caused ``main.py`` macro updates to have no effect on signals.
+
+* Multi-timeframe bias is computed from H4 and D1 DataFrames when present in
+  ``market_data``. Keys "H4" and "D1" are optional; absent keys degrade
+  gracefully to NEUTRAL bias (score=0 contribution).
+
+Pipeline position::
+
     market_data → execution.signal_engine.generate_signal()   ← this module
         → human-readable trade card / None
 
@@ -50,6 +62,7 @@ from data.macro_data import MacroDataHandler
 # ---------------------------------------------------------------------------
 # Signal / execution imports
 # ---------------------------------------------------------------------------
+from ai.bias_model import calculate_bias
 from ai.probability_model import compute_probability
 from execution.potential_setup import evaluate_potential_setup
 from execution.trade_setup import build_trade_setup
@@ -63,22 +76,52 @@ from execution.signal_formatter import format_trade_signal
 # Execution timeframe — all entry signals are derived from M5.
 _EXECUTION_TIMEFRAME = "M5"
 
+# Higher timeframes used for bias calculation (order: highest → lowest).
+_BIAS_TIMEFRAMES = ["D1", "H4", "H1"]
+
 # Bias → account-equity parameters forwarded to the risk manager.
-# Values match AI_RULES.md: 1% daily loss cap.
 _DEFAULT_ACCOUNT_BALANCE: float = 10_000.0
 _DEFAULT_OPEN_TRADES:     int   = 0
 _DEFAULT_DAILY_LOSS:      float = 0.0
 
-# Confidence label (from potential_setup) → numeric score used by the risk
-# manager (gate: confidence < 70) and the signal formatter (displayed as %).
+# Confidence label (from potential_setup) → numeric score used by the risk manager.
 _CONFIDENCE_SCORE: dict[str, float] = {
     "HIGH":   85.0,
     "MEDIUM": 70.0,
 }
 
-# Module-level macro handler (stateless default — no events registered).
-# In production, inject events from an economic calendar before market open.
+# OB recency: only order blocks from the last N candles are considered "near".
+# This prevents stale OBs from incorrectly flagging near_order_block=True.
+_OB_RECENCY_BARS: int = 50
+
+# ---------------------------------------------------------------------------
+# Module-level shared macro handler.
+#
+# IMPORTANT: This is the single source of truth for macro state in the
+# execution pipeline.  Use ``get_macro_handler()`` to access it from other
+# modules (e.g. main.py) rather than creating new MacroDataHandler instances.
+# ---------------------------------------------------------------------------
 _macro_handler = MacroDataHandler()
+
+
+def get_macro_handler() -> MacroDataHandler:
+    """Return the shared MacroDataHandler instance used by the signal engine.
+
+    Callers that need to register news events or update DXY/yield trends
+    should use this function to obtain the same handler that signal generation
+    reads from, avoiding the isolation bug where separate instances have
+    independent state.
+
+    Example::
+
+        from execution.signal_engine import get_macro_handler
+        handler = get_macro_handler()
+        handler.update_dxy("FALLING")
+        handler.update_yields("FALLING")
+        handler.add_event("NFP", scheduled_utc)
+    """
+    return _macro_handler
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -101,32 +144,20 @@ def generate_signal(market_data: dict) -> str | None:
 def generate_signal_dict(market_data: dict) -> dict | None:
     """Run the full pipeline and return the raw signal dict, or ``None``.
 
-    Identical pipeline to :func:`generate_signal` but skips the final
-    formatting step, returning the ``output_signal`` dict directly so
-    callers (e.g. backtesting) can access ``entry``, ``stop_loss``,
-    ``take_profit``, ``risk_reward``, ``bias``, etc.
-
     Parameters
     ----------
     market_data : dict
         Keys are timeframe identifiers; values are OHLCV DataFrames.
-        The M5 DataFrame must contain at minimum:
-        ``timestamp``, ``open``, ``high``, ``low``, ``close``, ``volume``.
+        Required key: ``"M5"`` (execution timeframe).
+        Optional keys: ``"D1"``, ``"H4"``, ``"H1"`` (used for MTF bias).
 
     Returns
     -------
     dict or None
-        Raw signal dict containing at minimum ``"entry"``, ``"stop_loss"``,
-        ``"take_profit"``, ``"risk_reward"``, ``"bias"``, ``"confidence"``
-        and ``"atr"``, or ``None`` when no tradeable setup exists.
-
-    Notes
-    -----
-    The function is intentionally *silent* on rejection.
+        Raw signal dict or ``None`` when no tradeable setup exists.
     """
     # ------------------------------------------------------------------ #
-    # MACRO BLACKOUT GATE — Hard block during high-impact news events     #
-    # No technical setup, however strong, is valid during CPI/NFP/FOMC.  #
+    # MACRO BLACKOUT GATE                                                 #
     # ------------------------------------------------------------------ #
     import datetime
     _now = datetime.datetime.now(tz=datetime.timezone.utc)
@@ -135,19 +166,13 @@ def generate_signal_dict(market_data: dict) -> dict | None:
 
     # ------------------------------------------------------------------ #
     # STEP 1 — Extract M5 execution timeframe data                       #
-    # All entry signals are derived from M5 candles.  None or empty       #
-    # DataFrames are rejected immediately.                                #
     # ------------------------------------------------------------------ #
     df = market_data.get(_EXECUTION_TIMEFRAME)
     if df is None or (isinstance(df, pd.DataFrame) and df.empty):
         return None
 
     # ------------------------------------------------------------------ #
-    # STEP 2 — Run the full analysis pipeline                             #
-    # Order is mandatory (each stage depends on the previous):           #
-    #   indicators → swings → equal_levels → market_structure            #
-    #   → liquidity_pools → liquidity_sweeps → order_blocks              #
-    # Any ValueError from missing columns is a data-quality failure.     #
+    # STEP 2 — Run the full analysis pipeline on M5                      #
     # ------------------------------------------------------------------ #
     try:
         df = compute_indicators(df)
@@ -166,13 +191,39 @@ def generate_signal_dict(market_data: dict) -> dict | None:
         return None
 
     # ------------------------------------------------------------------ #
-    # STEP 3 — Extract latest row                                        #
+    # STEP 3 — Build multi-timeframe bias from H1/H4/D1                  #
+    # Each HTF DataFrame is run through the full indicator + structure    #
+    # pipeline so that trend_state and event_type are available for the   #
+    # bias model.  Missing timeframes degrade gracefully to NEUTRAL.      #
+    # ------------------------------------------------------------------ #
+    mtf_data: dict[str, pd.DataFrame] = {}
+    for tf in _BIAS_TIMEFRAMES:
+        htf_df = market_data.get(tf)
+        if htf_df is not None and isinstance(htf_df, pd.DataFrame) and not htf_df.empty:
+            try:
+                htf_df = compute_indicators(htf_df)
+                htf_df = detect_swings(htf_df)
+                htf_df = detect_equal_levels(htf_df)
+                htf_df = detect_market_structure(htf_df, timeframe=tf)
+                # Rename to the column names expected by bias_model
+                htf_df = htf_df.rename(
+                    columns={"trend_state": "trend", "event_type": "event"}
+                )
+                mtf_data[tf] = htf_df
+            except (ValueError, KeyError):
+                # Degrade gracefully — this timeframe won't contribute to bias
+                pass
+
+    # Calculate weighted MTF bias
+    mtf_bias = calculate_bias(mtf_data)
+
+    # ------------------------------------------------------------------ #
+    # STEP 4 — Extract latest row                                        #
     # ------------------------------------------------------------------ #
     row = df.iloc[-1]
 
     # ------------------------------------------------------------------ #
-    # STEP 4 — Derive directional bias from trend state                  #
-    # TRANSITION indicates structural ambiguity; no signal is generated. #
+    # STEP 5 — Derive directional bias from trend state                  #
     # ------------------------------------------------------------------ #
     trend_state = str(row.get("trend_state", "TRANSITION")).upper()
     if trend_state not in ("BULLISH", "BEARISH"):
@@ -180,12 +231,23 @@ def generate_signal_dict(market_data: dict) -> dict | None:
     bias = trend_state
 
     # ------------------------------------------------------------------ #
-    # STEP 5 — Build the market context dictionary                       #
+    # STEP 6 — Check MTF hard block                                      #
+    # When the dominant HTF bias strongly opposes M5 direction, block.   #
     # ------------------------------------------------------------------ #
+    mtf_direction = mtf_bias.get("bias", "NEUTRAL")
+    mtf_strength  = mtf_bias.get("strength", "WEAK")
+    mtf_context   = mtf_bias.get("context", "CONSOLIDATION")
 
-    # Market structure: map the raw event_type to the labels recognised by
-    # evaluate_potential_setup.  LIQUIDITY_SWEEP is a liquidity event, not
-    # a structural one, so it maps to "NONE" here and is captured below.
+    # Strong opposing bias blocks the trade (not during reversals)
+    if mtf_context != "REVERSAL":
+        if bias == "BULLISH" and mtf_direction == "BEARISH" and mtf_strength == "STRONG":
+            return None
+        if bias == "BEARISH" and mtf_direction == "BULLISH" and mtf_strength == "STRONG":
+            return None
+
+    # ------------------------------------------------------------------ #
+    # STEP 7 — Build the market context dictionary                       #
+    # ------------------------------------------------------------------ #
     raw_event = str(row.get("event_type", "")).upper()
     _STRUCTURE_MAP = {
         "BOS_CONFIRMED": "BOS_CONFIRMED",
@@ -194,8 +256,7 @@ def generate_signal_dict(market_data: dict) -> dict | None:
     }
     market_structure = _STRUCTURE_MAP.get(raw_event, "NONE")
 
-    # Liquidity: priority is SWEEP > EQUAL > NONE.
-    # Sweeps (stop-hunts) are the strongest institutional signal.
+    # Liquidity classification
     has_sweep = (
         bool(row.get("liquidity_sweep_high", False))
         or bool(row.get("liquidity_sweep_low", False))
@@ -211,8 +272,7 @@ def generate_signal_dict(market_data: dict) -> dict | None:
     else:
         liquidity = "NONE"
 
-    # OHLC sanity: high must be >= max(open, close); low must be <= min(open, close).
-    # Violations indicate corrupt feed data; no signal is generated.
+    # OHLC sanity check
     _o = _safe_float(row, "open")
     _h = _safe_float(row, "high")
     _l = _safe_float(row, "low")
@@ -224,8 +284,7 @@ def generate_signal_dict(market_data: dict) -> dict | None:
         return None
     close = _c
 
-    # EMA alignment: bullish when stacked 20 > 50 > 200, bearish when inverted.
-    # All three EMAs must be finite; NaN indicates insufficient warm-up data.
+    # EMA alignment
     ema_20  = _safe_float(row, "EMA_20")
     ema_50  = _safe_float(row, "EMA_50")
     ema_200 = _safe_float(row, "EMA_200")
@@ -238,47 +297,43 @@ def generate_signal_dict(market_data: dict) -> dict | None:
     else:
         ema_alignment = "MIXED"
 
-    # ATR: validated through _validate_atr (NaN / <=0 / <0.1 -> None; >100 -> cap).
+    # ATR validation
     atr = _validate_atr(_safe_float(row, "ATR"))
     if atr is None:
         return None
 
-    # RSI: must be finite and within [0, 100]; a fallback default would mask
-    # abnormal values and allow corrupted data to produce trade signals.
+    # RSI validation
     _raw_rsi = _safe_float(row, "RSI")
     if not _all_finite(_raw_rsi) or not (0.0 <= _raw_rsi <= 100.0):
         return None
     rsi = _raw_rsi
 
+    # VWAP position
     vwap = _safe_float(row, "VWAP", default=float("nan"))
-
-    # VWAP position: price above VWAP favours longs; below favours shorts.
-    # When VWAP is unavailable (NaN) fall back to bias-consistent assumption.
     if _all_finite(vwap):
         vwap_position = "ABOVE" if close > vwap else "BELOW"
     else:
         vwap_position = "ABOVE" if bias == "BULLISH" else "BELOW"
 
-    # Price range: prefer structure levels (protected_high/low) which
-    # reflect the last confirmed swing, falling back to the 20-bar window.
-    # _safe_float + _all_finite handles the case where the column exists
-    # but contains NaN (row.get() returns NaN, not the default, for NaN values).
+    # Price range from protected levels or 20-bar fallback
     _ph = _safe_float(row, "protected_high")
     recent_high = float(_ph if _all_finite(_ph) else df["high"].iloc[-20:].max())
     _pl = _safe_float(row, "protected_low")
     recent_low  = float(_pl if _all_finite(_pl) else df["low"].iloc[-20:].min())
 
-    # Near order block: True when price lies inside a valid OB zone where
-    # both levels are non-NaN and ob_high > ob_low (degenerate OBs skipped).
+    # Near order block — only consider recent OBs within _OB_RECENCY_BARS
     price = close
+    near_order_block = False
     if "ob_high" in df.columns and "ob_low" in df.columns:
-        ob_pairs = df[["ob_high", "ob_low"]].dropna()
+        # Restrict to recent candles to avoid stale OB false positives
+        recent_df = df.iloc[-_OB_RECENCY_BARS:]
+        ob_pairs = recent_df[["ob_high", "ob_low"]].dropna()
         near_order_block = any(
             ob_h > ob_l and ob_l <= price <= ob_h
             for ob_h, ob_l in zip(ob_pairs["ob_high"], ob_pairs["ob_low"])
         )
-    else:
-        near_order_block = False
+
+    macro_ctx = _macro_handler.get_macro_context()
 
     context: dict = {
         "market_structure": market_structure,
@@ -299,16 +354,20 @@ def generate_signal_dict(market_data: dict) -> dict | None:
         "recent_high":      recent_high,
         "recent_low":       recent_low,
         "entry_price":      close,
-        **_macro_handler.get_macro_context(),
+        **macro_ctx,
     }
     context["macro_sentiment"] = context.get("gold_sentiment", "NEUTRAL")
 
     # ------------------------------------------------------------------ #
-    # STEP 6 — Probability scoring                                       #
-    # compute_probability() requires an R:R estimate.  We approximate it  #
-    # from raw context geometry (same SL formula as build_trade_setup)    #
-    # to avoid a circular dependency.  The full trade is built later in  #
-    # STEP 8 using the same ATR-based SL, so the RR here is consistent.  #
+    # STEP 8 — Apply MTF bias confidence adjustment to context           #
+    # Pass MTF info so probability model and potential_setup can use it. #
+    # ------------------------------------------------------------------ #
+    context["mtf_bias"]      = mtf_direction
+    context["mtf_strength"]  = mtf_strength
+    context["mtf_context"]   = mtf_context
+
+    # ------------------------------------------------------------------ #
+    # STEP 9 — Probability scoring (approximate RR)                      #
     # ------------------------------------------------------------------ #
     if bias == "BULLISH":
         raw_sl     = recent_low  - (0.5 * atr)
@@ -321,16 +380,17 @@ def generate_signal_dict(market_data: dict) -> dict | None:
 
     approx_rr = (raw_reward / raw_risk) if raw_risk > 0 else 0.0
 
+    # Apply MTF confidence adjustment to approximate probability
+    mtf_adj = _compute_mtf_probability_adjustment(bias, mtf_direction, mtf_strength, mtf_context)
+
     prob_result = compute_probability(
         {"bias": bias, "risk_reward": approx_rr},
         context,
     )
-    probability = int(prob_result["probability"])
+    probability = max(0, min(100, int(prob_result["probability"]) + mtf_adj))
 
     # ------------------------------------------------------------------ #
-    # STEP 7 — Potential setup quality gate                              #
-    # Enforces hard minimums (probability, R:R, ATR) and classifies the  #
-    # setup type before the full trade is built.                          #
+    # STEP 10 — Potential setup quality gate                             #
     # ------------------------------------------------------------------ #
     setup_signal = {
         "probability": probability,
@@ -342,7 +402,7 @@ def generate_signal_dict(market_data: dict) -> dict | None:
         return None
 
     # ------------------------------------------------------------------ #
-    # STEP 8 — Trade setup (precise entry, SL, TP, RR)                  #
+    # STEP 11 — Trade setup (precise entry, SL, TP, RR)                 #
     # ------------------------------------------------------------------ #
     trade = build_trade_setup(
         {"bias": bias},
@@ -351,25 +411,29 @@ def generate_signal_dict(market_data: dict) -> dict | None:
     if trade is None:
         return None
 
-    # ------------------------------------------------------------------ #
-    # STEP 8b — Recompute probability with the exact trade R:R           #
-    # The STEP 6 estimate used approximate geometry; now that the         #
-    # precise trade is built we replace it with the real risk_reward.    #
-    # ------------------------------------------------------------------ #
-    probability = int(
+    # Recompute probability with exact trade RR
+    probability = max(0, min(100, int(
         compute_probability(
             {"bias": bias, "risk_reward": trade["risk_reward"]},
             context,
         )["probability"]
-    )
+    ) + mtf_adj))
 
     # ------------------------------------------------------------------ #
-    # STEP 9 — Numeric confidence for risk manager and formatter         #
-    # potential_setup returns "HIGH"/"MEDIUM"; downstream modules require #
-    # a numeric score (risk_manager gate: confidence < 70).              #
+    # STEP 12 — Numeric confidence for risk manager                      #
     # ------------------------------------------------------------------ #
     confidence_label = setup_result.get("confidence", "MEDIUM")
     confidence_score = _CONFIDENCE_SCORE.get(confidence_label, 70.0)
+
+    # Apply a weak opposing MTF penalty to confidence if applicable
+    if mtf_context != "REVERSAL":
+        if (bias == "BULLISH" and mtf_direction == "BEARISH") or \
+           (bias == "BEARISH" and mtf_direction == "BULLISH"):
+            confidence_score = max(0.0, confidence_score - 15.0)
+    elif mtf_context != "REVERSAL":
+        if (bias == "BULLISH" and mtf_direction == "BULLISH") or \
+           (bias == "BEARISH" and mtf_direction == "BEARISH"):
+            confidence_score = min(100.0, confidence_score + 10.0)
 
     trade_signal: dict = {
         **trade,
@@ -378,7 +442,7 @@ def generate_signal_dict(market_data: dict) -> dict | None:
     }
 
     # ------------------------------------------------------------------ #
-    # STEP 10 — Risk manager validation gate                             #
+    # STEP 13 — Risk manager validation gate                             #
     # ------------------------------------------------------------------ #
     risk = evaluate_risk(
         trade_signal,
@@ -390,20 +454,61 @@ def generate_signal_dict(market_data: dict) -> dict | None:
         return None
 
     # ------------------------------------------------------------------ #
-    # STEP 11 — Format and return the trade card                         #
+    # STEP 14 — Assemble final output signal                             #
     # ------------------------------------------------------------------ #
     output_signal: dict = {
         **trade_signal,
         "pair":          "XAUUSD",
         "timeframe":     _EXECUTION_TIMEFRAME,
         "bias":          bias,
-        # mtf_bias mirrors M5 bias; multi-timeframe injection is a
-        # future enhancement when HTF DataFrames are passed in market_data.
-        "mtf_bias":      bias,
-        "bias_strength": confidence_label,
-        "context":       f"{setup_result.get('setup_type', 'UNKNOWN')} setup",
+        "mtf_bias":      mtf_direction,
+        "bias_strength": mtf_strength,
+        "context":       f"{setup_result.get('setup_type', 'UNKNOWN')} setup | MTF: {mtf_context}",
+        "mtf_score":     round(mtf_bias.get("score", 0.0), 3),
+        "probability":   probability,
     }
     return output_signal
+
+
+# ---------------------------------------------------------------------------
+# MTF probability adjustment
+# ---------------------------------------------------------------------------
+
+
+def _compute_mtf_probability_adjustment(
+    bias: str,
+    mtf_direction: str,
+    mtf_strength: str,
+    mtf_context: str,
+) -> int:
+    """Compute a probability score adjustment based on MTF alignment.
+
+    Returns an integer delta to add to the raw probability score:
+
+    * Aligned STRONG  → +15  (institutional flow fully behind the trade)
+    * Aligned WEAK    → +7   (partial institutional alignment)
+    * REVERSAL context → 0   (HTF is mid-transition; no adjustment)
+    * Opposing WEAK   → -10  (some counter-flow pressure)
+    * Opposing STRONG → trade is already blocked upstream; returns -20
+    * NEUTRAL          → 0   (no macro information either way)
+    """
+    if mtf_context == "REVERSAL":
+        return 0
+
+    aligned = (
+        (bias == "BULLISH" and mtf_direction == "BULLISH") or
+        (bias == "BEARISH" and mtf_direction == "BEARISH")
+    )
+    opposing = (
+        (bias == "BULLISH" and mtf_direction == "BEARISH") or
+        (bias == "BEARISH" and mtf_direction == "BULLISH")
+    )
+
+    if aligned:
+        return 15 if mtf_strength == "STRONG" else 7
+    if opposing:
+        return -20 if mtf_strength == "STRONG" else -10
+    return 0  # NEUTRAL
 
 
 # ---------------------------------------------------------------------------
@@ -412,18 +517,7 @@ def generate_signal_dict(market_data: dict) -> dict | None:
 
 
 def _validate_atr(atr: float) -> float | None:
-    """Ensure ATR is usable for trading logic.
-
-    Rules:
-    - NaN  -> None
-    - <= 0 -> None
-    - < 0.1 -> None  (too-low volatility; warm-up artifact or stale feed)
-    - > 100 -> cap to 100.0  (spike protection; prevents degenerate geometry)
-
-    Returns:
-        Validated ATR float, or None to signal that the candle should be
-        skipped without generating a trade signal.
-    """
+    """Ensure ATR is usable for trading logic."""
     import math
     if math.isnan(atr):
         return None
@@ -437,8 +531,7 @@ def _validate_atr(atr: float) -> float | None:
 
 
 def _safe_float(row, key: str, *, default: float = float("nan")) -> float:
-    """Extract a float from a row-like object, returning *default* on KeyError
-    or when the value is NaN."""
+    """Extract a float from a row-like object, returning *default* on error."""
     try:
         val = float(row[key])
     except (KeyError, TypeError, ValueError):
